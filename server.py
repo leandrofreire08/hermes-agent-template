@@ -260,10 +260,11 @@ from urllib.parse import quote as _url_quote, urlparse as _urlparse
 
 COOKIE_NAME = "hermes_auth"
 COOKIE_MAX_AGE = 7 * 86400  # 7 days
-COOKIE_SECRET = secrets.token_bytes(32)
+_secret_env = os.environ.get("HERMES_COOKIE_SECRET", "")
+COOKIE_SECRET = _secret_env.encode() if _secret_env else secrets.token_bytes(32)
 
 # Public paths — no auth required. Everything else is behind the cookie gate.
-PUBLIC_PATHS = {"/health", "/login", "/logout"}
+PUBLIC_PATHS = {"/health", "/login", "/logout", "/api/status"}
 
 
 def _make_auth_token() -> str:
@@ -285,7 +286,9 @@ def _verify_auth_token(token: str) -> bool:
 
 
 def _is_authenticated(request: Request) -> bool:
-    return _verify_auth_token(request.cookies.get(COOKIE_NAME, ""))
+    token = (request.cookies.get(COOKIE_NAME, "")
+             or request.headers.get("X-Hermes-Session-Token", ""))
+    return _verify_auth_token(token)
 
 
 def _safe_return_to(value: str) -> str:
@@ -305,7 +308,7 @@ def guard(request: Request) -> Response | None:
     - HTML navigation: 302 to /login?returnTo=<path>
     - API / XHR: 401 JSON (so the SPA's fetch() can surface it cleanly)
     """
-    if _is_authenticated(request):
+    if request.url.path in PUBLIC_PATHS or _is_authenticated(request):
         return None
     accept = request.headers.get("accept", "").lower()
     wants_html = "text/html" in accept
@@ -909,6 +912,26 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     )
 
 
+async def api_auth_token(request: Request) -> Response:
+    """POST /api/auth/token — exchange credentials for a session token.
+
+    Body: {"username": "...", "password": "..."}
+    Returns: {"token": "..."}  (same value as hermes_auth cookie)
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    username = body.get("username", "")
+    password = body.get("password", "")
+    valid_user = _hmac.compare_digest(username, ADMIN_USERNAME)
+    valid_pw   = _hmac.compare_digest(password, ADMIN_PASSWORD)
+    if not (valid_user and valid_pw):
+        return JSONResponse({"error": "Invalid credentials"}, status_code=401)
+    token = _make_auth_token()
+    return JSONResponse({"token": token})
+
+
 async def route_root(request: Request) -> Response:
     """GET /: first-visit smart redirect, otherwise proxy to the dashboard.
 
@@ -988,6 +1011,7 @@ routes = [
     Route("/setup/api/gateway/restart",         api_gw_restart,      methods=["POST"]),
     Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
     Route("/setup/api/test-provider",           api_test_provider,   methods=["POST"]),
+    Route("/api/auth/token",                  api_auth_token,      methods=["POST"]),
     Route("/setup/api/pairing/pending",         api_pairing_pending),
     Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),
     Route("/setup/api/pairing/deny",            api_pairing_deny,    methods=["POST"]),
