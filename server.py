@@ -288,8 +288,11 @@ def _verify_auth_token(token: str) -> bool:
 
 
 def _is_authenticated(request: Request) -> bool:
+    auth_header = request.headers.get("Authorization", "")
+    bearer = auth_header[len("Bearer "):] if auth_header.startswith("Bearer ") else ""
     token = (request.cookies.get(COOKIE_NAME, "")
-             or request.headers.get("X-Hermes-Session-Token", ""))
+             or request.headers.get("X-Hermes-Session-Token", "")
+             or bearer)
     return _verify_auth_token(token)
 
 
@@ -528,6 +531,7 @@ class Dashboard:
                 "--host", HERMES_DASHBOARD_HOST,
                 "--port", str(HERMES_DASHBOARD_PORT),
                 "--no-open",
+                "--tui",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -863,6 +867,10 @@ async def _proxy_to_dashboard(request: Request) -> Response:
         k: v for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP
     }
+    # Inject dashboard session token so the dashboard's own auth middleware accepts the request
+    dash_tok = _dashboard_session_token()
+    if dash_tok:
+        req_headers["X-Hermes-Session-Token"] = dash_tok
     body = await request.body()
 
     try:
@@ -915,6 +923,23 @@ async def _proxy_to_dashboard(request: Request) -> Response:
 
 
 
+_DASH_TOKEN_CACHE: str = ""
+
+def _dashboard_session_token() -> str:
+    """Return cached dashboard session token, refresh from HTML if empty."""
+    global _DASH_TOKEN_CACHE
+    if _DASH_TOKEN_CACHE:
+        return _DASH_TOKEN_CACHE
+    import urllib.request as _ur, re as _re
+    try:
+        html = _ur.urlopen(f"http://127.0.0.1:{DASHBOARD_PORT}/", timeout=3).read().decode()
+        m = _re.search(r'__HERMES_SESSION_TOKEN__="([^"]+)"', html)
+        _DASH_TOKEN_CACHE = m.group(1) if m else ""
+    except Exception:
+        _DASH_TOKEN_CACHE = ""
+    return _DASH_TOKEN_CACHE
+
+
 async def ws_proxy_to_dashboard(websocket: StarletteWebSocket) -> None:
     """WebSocket reverse proxy: client -> server.py -> dashboard:9119."""
     import asyncio
@@ -934,11 +959,7 @@ async def ws_proxy_to_dashboard(websocket: StarletteWebSocket) -> None:
     await websocket.accept()
 
     path = websocket.url.path
-    query = websocket.url.query
-    upstream_url = f"ws://127.0.0.1:{DASHBOARD_PORT}{path}"
-    if query:
-        upstream_url += f"?{query}"
-
+    upstream_url = f"ws://127.0.0.1:{DASHBOARD_PORT}{path}?token={_dashboard_session_token()}"
     try:
         async with _ws.connect(upstream_url) as upstream:
             async def c2u():
@@ -965,7 +986,9 @@ async def ws_proxy_to_dashboard(websocket: StarletteWebSocket) -> None:
                     pass
 
             await asyncio.gather(c2u(), u2c())
-    except Exception:
+    except Exception as _exc:
+        global _DASH_TOKEN_CACHE
+        _DASH_TOKEN_CACHE = ""  # invalidate cache on failure
         try:
             await websocket.close(code=1011)
         except Exception:
