@@ -34,6 +34,7 @@ from pathlib import Path
 
 import httpx
 from starlette.applications import Starlette
+from starlette.websockets import WebSocket as StarletteWebSocket
 from starlette.requests import Request
 from starlette.responses import (
     HTMLResponse,
@@ -41,7 +42,7 @@ from starlette.responses import (
     RedirectResponse,
     Response,
 )
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 from starlette.templating import Jinja2Templates
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
@@ -55,6 +56,7 @@ PAIRING_TTL = 3600
 # Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
+DASHBOARD_PORT = HERMES_DASHBOARD_PORT
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
@@ -912,6 +914,56 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     )
 
 
+
+async def ws_proxy_to_dashboard(websocket: StarletteWebSocket) -> None:
+    """WebSocket reverse proxy: client -> server.py -> dashboard:9119."""
+    import asyncio
+    try:
+        import websockets as _ws
+    except ImportError:
+        await websocket.close(code=1011)
+        return
+
+    token = (websocket.cookies.get(COOKIE_NAME, "")
+             or websocket.headers.get("X-Hermes-Session-Token", ""))
+    if not _verify_auth_token(token):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    path = websocket.url.path
+    query = websocket.url.query
+    upstream_url = f"ws://127.0.0.1:{DASHBOARD_PORT}{path}"
+    if query:
+        upstream_url += f"?{query}"
+
+    try:
+        async with _ws.connect(upstream_url) as upstream:
+            async def c2u():
+                try:
+                    async for msg in websocket.iter_bytes():
+                        await upstream.send(msg)
+                except Exception:
+                    pass
+
+            async def u2c():
+                try:
+                    async for msg in upstream:
+                        if isinstance(msg, bytes):
+                            await websocket.send_bytes(msg)
+                        else:
+                            await websocket.send_text(msg)
+                except Exception:
+                    pass
+
+            await asyncio.gather(c2u(), u2c())
+    except Exception:
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
 async def api_auth_token(request: Request) -> Response:
     """POST /api/auth/token — exchange credentials for a session token.
 
@@ -1025,6 +1077,8 @@ routes = [
     Route("/",                                  route_root,          methods=ANY_METHOD),
 
     # Catch-all: everything else proxies to the Hermes dashboard subprocess.
+    WebSocketRoute("/api/ws",                      ws_proxy_to_dashboard),
+    WebSocketRoute("/{path:path}",                 ws_proxy_to_dashboard),
     Route("/{path:path}",                       route_proxy,         methods=ANY_METHOD),
 ]
 
