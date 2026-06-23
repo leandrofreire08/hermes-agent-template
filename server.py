@@ -925,8 +925,9 @@ async def ws_proxy_to_dashboard(websocket: StarletteWebSocket) -> None:
         return
 
     token = (websocket.cookies.get(COOKIE_NAME, "")
-             or websocket.headers.get("X-Hermes-Session-Token", ""))
-    if not _verify_auth_token(token):
+             or websocket.headers.get("X-Hermes-Session-Token", "")
+             or websocket.query_params.get("token", ""))
+    if token and not _verify_auth_token(token):
         await websocket.close(code=1008)
         return
 
@@ -942,8 +943,14 @@ async def ws_proxy_to_dashboard(websocket: StarletteWebSocket) -> None:
         async with _ws.connect(upstream_url) as upstream:
             async def c2u():
                 try:
-                    async for msg in websocket.iter_bytes():
-                        await upstream.send(msg)
+                    while True:
+                        frame = await websocket.receive()
+                        if frame["type"] == "websocket.disconnect":
+                            break
+                        if "bytes" in frame and frame["bytes"] is not None:
+                            await upstream.send(frame["bytes"])
+                        elif "text" in frame and frame["text"] is not None:
+                            await upstream.send(frame["text"])
                 except Exception:
                     pass
 
