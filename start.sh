@@ -1,10 +1,15 @@
 #!/bin/bash
 set -e
 
-# Mirror dashboard-ref-only's startup: create every directory hermes expects
-# and seed a default config.yaml if the volume is empty. Without these,
-# `hermes dashboard` endpoints that hit logs/, sessions/, cron/, etc. can fail
-# with opaque errors even though no auth is actually involved.
+# Fix ownership: the /opt/hermes/bin/hermes shim drops root to uid 10000
+# (hermes user). Volume-mounted data originally created as uid 1024 becomes
+# inaccessible. Chown once at boot so every subsequent access is uid-aligned.
+if [ "$(id -u)" = "0" ]; then
+    chown -R 10000:10000 /data 2>/dev/null || true
+fi
+
+# Mirror dashboard-ref-only startup: create every directory hermes expects
+# and seed a default config.yaml if the volume is empty.
 mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
          /data/.hermes/memories /data/.hermes/skills /data/.hermes/pairing \
          /data/.hermes/hooks /data/.hermes/image_cache /data/.hermes/audio_cache \
