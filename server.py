@@ -1,5 +1,5 @@
 """
-Hermes Agent — Railway admin server.
+Hermes Agent — admin server.
 
 Responsibilities:
   - Admin UI / setup wizard at /setup (Starlette + Jinja, cookie-auth guarded)
@@ -14,7 +14,7 @@ and basic-auth's per-directory protection space forced separate prompts for
 /setup and /. Cookies auto-include on every same-origin request, so both the
 setup UI and the proxied dashboard work with a single login. The cookie signing
 secret is regenerated on every process start, so any ADMIN_PASSWORD change on
-Railway (which triggers a redeploy) invalidates all existing sessions.
+A redeploy invalidates all existing sessions.
 
 First-visit behavior: if no provider+model config exists, GET / redirects to /setup.
 Once configured, / proxies to the Hermes dashboard. A small "← Setup" widget is
@@ -253,7 +253,7 @@ def unmask(new: dict[str, str], existing: dict[str, str]) -> dict[str, str]:
 # so both the setup UI and the proxied Hermes dashboard work with one login.
 #
 # The SECRET is regenerated on every process start. That means any ADMIN_PASSWORD
-# change via Railway → redeploy → all existing cookies invalidate → users re-login.
+# change via env var → redeploy → all existing cookies invalidate → users re-login.
 import hashlib as _hashlib
 import hmac as _hmac
 from urllib.parse import quote as _url_quote, urlparse as _urlparse
@@ -362,7 +362,7 @@ button:hover{background:#7b8fff;border-color:#7b8fff}
     <input id="password" name="password" type="password" autocomplete="current-password" required>
     <button type="submit">Sign in</button>
   </form>
-  <p class="footnote">Credentials are the <code>ADMIN_USERNAME</code> and <code>ADMIN_PASSWORD</code><br>Railway service variables.</p>
+  <p class="footnote">Credentials are the <code>ADMIN_USERNAME</code> and <code>ADMIN_PASSWORD</code><br>environment variables (or set in /data/.hermes/.env).</p>
 </div>
 </body></html>"""
 
@@ -430,7 +430,7 @@ class Gateway:
             return
         self.state = "starting"
         try:
-            # .env values take priority over Railway env vars.
+            # .env values take priority over env vars.
             # We build the env this way so hermes's own dotenv loading
             # (which reads the same file) doesn't shadow our values.
             env = {**os.environ, "HERMES_HOME": HERMES_HOME}
@@ -504,7 +504,7 @@ class Dashboard:
     The dashboard is independent of the gateway: it reads config files
     directly and tolerates a stopped gateway.
 
-    All subprocess output is streamed to our stdout (→ Railway logs) with a
+    All subprocess output is streamed to our stdout with a
     `[dashboard]` prefix AND retained in a ring buffer for diagnostics.
     Unexpected exits are explicitly logged with their return code.
     """
@@ -532,7 +532,7 @@ class Dashboard:
             print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
 
     async def _drain(self):
-        """Stream subprocess output to Railway logs (prefixed) and a ring buffer."""
+        """Stream subprocess output to stdout (prefixed) and a ring buffer."""
         assert self.proc and self.proc.stdout
         try:
             async for raw in self.proc.stdout:
@@ -873,7 +873,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
         print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
 
-    # Surface non-2xx responses from hermes into Railway logs so we can
+    # Surface non-2xx responses from hermes into logs so we can
     # diagnose 401/500s without needing browser DevTools access.
     if upstream.status_code >= 400:
         body_snip = upstream.content[:200].decode("utf-8", errors="replace")
