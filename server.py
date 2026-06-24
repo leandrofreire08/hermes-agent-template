@@ -291,9 +291,15 @@ def _is_authenticated(request: Request) -> bool:
     auth_header = request.headers.get("Authorization", "")
     bearer = auth_header[len("Bearer "):] if auth_header.startswith("Bearer ") else ""
     token = (request.cookies.get(COOKIE_NAME, "")
-             or request.headers.get("X-Hermes-Session-Token", "")
              or bearer)
-    return _verify_auth_token(token)
+    session_hdr = request.headers.get("X-Hermes-Session-Token", "")
+    if session_hdr:
+        if _verify_auth_token(session_hdr):
+            return True
+        dash = _dashboard_session_token()
+        if dash and session_hdr == dash:
+            return True
+    return bool(token) and _verify_auth_token(token)
 
 
 def _safe_return_to(value: str) -> str:
@@ -556,6 +562,9 @@ class Dashboard:
                 print(f"[dashboard] EXITED with code {rc} — reverse proxy will return 503 until restart", flush=True)
             elif rc == 0:
                 print(f"[dashboard] exited cleanly (code 0)", flush=True)
+            # Invalidate cached session token — dashboard will generate a new one on restart
+            global _DASH_TOKEN_CACHE
+            _DASH_TOKEN_CACHE = ""
 
     async def stop(self):
         if not self.proc or self.proc.returncode is not None:
@@ -864,13 +873,13 @@ async def _proxy_to_dashboard(request: Request) -> Response:
         target = f"{target}?{request.url.query}"
 
     req_headers = {
-        k: v for k, v in request.headers.items()
+        k.lower(): v for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP
     }
     # Inject dashboard session token so the dashboard's own auth middleware accepts the request
     dash_tok = _dashboard_session_token()
     if dash_tok:
-        req_headers["X-Hermes-Session-Token"] = dash_tok
+        req_headers["x-hermes-session-token"] = dash_tok
     body = await request.body()
 
     try:
