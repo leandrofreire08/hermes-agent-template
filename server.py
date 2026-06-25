@@ -59,6 +59,26 @@ HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 DASHBOARD_PORT = HERMES_DASHBOARD_PORT
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
 
+# Hermes gateway API server (OpenAI-compatible /v1/ routes) — loopback only.
+HERMES_GATEWAY_PORT = int(os.environ.get("API_SERVER_PORT", "8642"))
+HERMES_GATEWAY_URL = f"http://127.0.0.1:{HERMES_GATEWAY_PORT}"
+
+def _read_gateway_key() -> str:
+    """Read API_SERVER_KEY from env var or from the hermes .env file."""
+    val = os.environ.get("API_SERVER_KEY", "")
+    if val:
+        return val
+    try:
+        for line in Path(HERMES_HOME, ".env").read_text().splitlines():
+            line = line.strip()
+            if line.startswith("API_SERVER_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+HERMES_GATEWAY_KEY = _read_gateway_key()
+
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
 # else — notably `authorization`, because the SPA uses Bearer tokens against
@@ -932,6 +952,50 @@ async def _proxy_to_dashboard(request: Request) -> Response:
 
 
 
+async def _proxy_to_gateway(request: Request) -> Response:
+    """Forward /v1/* requests to the Hermes gateway API server (port 8642).
+
+    The gateway exposes an OpenAI-compatible API and requires its own key.
+    We strip the caller's auth and inject the gateway key so upstream clients
+    (like hermes-workspace) authenticate against server.py while we handle
+    the gateway auth transparently.
+    """
+    client = get_http_client()
+    target = f"{HERMES_GATEWAY_URL}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    req_headers = {
+        k.lower(): v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    # Replace caller auth with the gateway API key.
+    if HERMES_GATEWAY_KEY:
+        req_headers["authorization"] = f"Bearer {HERMES_GATEWAY_KEY}"
+    else:
+        req_headers.pop("authorization", None)
+
+    body = await request.body()
+    try:
+        upstream = await client.request(
+            request.method, target, headers=req_headers, content=body,
+        )
+    except Exception as exc:
+        print(f"[gateway-proxy] upstream error for {request.method} {request.url.path}: {exc}", flush=True)
+        return Response("Bad Gateway", status_code=502, media_type="text/plain")
+
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    print(f"[gateway-proxy] {request.method} {request.url.path} -> {upstream.status_code}", flush=True)
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=resp_headers,
+    )
+
+
 _DASH_TOKEN_CACHE: str = ""
 
 def _dashboard_session_token() -> str:
@@ -1042,8 +1106,10 @@ async def route_root(request: Request) -> Response:
 
 
 async def route_proxy(request: Request) -> Response:
-    """Catch-all: forward any unmatched path to the Hermes dashboard."""
+    """Catch-all: forward to gateway for /v1/ paths, otherwise to dashboard."""
     if err := guard(request): return err
+    if request.url.path.startswith("/v1/"):
+        return await _proxy_to_gateway(request)
     return await _proxy_to_dashboard(request)
 
 
